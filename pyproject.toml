@@ -1,0 +1,34 @@
+[project]
+name = "spikeinterface_kilosort_reshape"
+version = '0.1.0'
+authors = [
+  { name="Pierre Yger", email="pierre.yger@inserm.fr" },
+  { name="Samuel Garcia", email="sam.garcia.die@gmail.com" },
+]
+
+description = "Adaption of some kilosrt algos into spikeinterface"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "spikeinterface>=0.101.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/SpikeInterface/spikeinterface-kilosort-reshape"
+Repository = "https://github.com/SpikeInterface/spikeinterface-kilosort-reshape"
+
+
+[build-system]
+requires = ["setuptools>=62.0"]
+build-backend = "setuptools.build_meta"
+
+
+[tool.setuptools]
+packages = ["spikeinterface_kilosort_reshape"]
+package-dir = {"spikeinterface_kilosort_reshape" = "spikeinterface_kilosort_reshape"}
