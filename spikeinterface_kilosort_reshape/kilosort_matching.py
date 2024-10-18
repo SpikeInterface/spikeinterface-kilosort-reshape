@@ -104,13 +104,13 @@ class KiloSortMatching(BaseTemplateMatching):
             for j in range(self.num_samples):
                 ix = imax == j
                 Unew_torch[ix] = torch.roll(Unew_torch[ix], self.num_samples // 2 - j, -2)
-            self.U = torch.einsum(
+            U = torch.einsum(
                 "xty, zt -> xzy", Unew_torch, torch.as_tensor(spatial_components, device=self.torch_device)
             )
-            self.W = torch.as_tensor(self.spatial_components, device=self.torch_device)
+            W = torch.as_tensor(self.spatial_components, device=self.torch_device)
             WtW = conv1d(
-                self.W.reshape(-1, 1, self.num_samples),
-                self.W.reshape(-1, 1, self.num_samples),
+                W.reshape(-1, 1, self.num_samples),
+                W.reshape(-1, 1, self.num_samples),
                 padding=self.num_samples,
             )
             WtW = torch.flip(
@@ -119,9 +119,19 @@ class KiloSortMatching(BaseTemplateMatching):
                     2,
                 ],
             )
-            UtU = torch.einsum("ikl, jml -> ijkm", self.U, self.U)
-            self.ctc = torch.einsum("ijkm, kml -> ijl", UtU, WtW)
-            self.trange = torch.arange(-self.num_samples, self.num_samples + 1, device=self.torch_device)
+            UtU = torch.einsum("ikl, jml -> ijkm", U, U)
+            ctc = torch.einsum("ijkm, kml -> ijl", UtU, WtW)
+            trange = torch.arange(-self.num_samples, self.num_samples + 1, device=self.torch_device)
+
+            nm = (U**2).sum(-1).sum(-1)
+
+            # put attribute into numpy
+            self.U = U.numpy()
+            self.W = W.numpy()
+            self.trange = trange.numpy()
+            self.ctc = ctc.numpy()
+            self.nm = nm.numpy()
+
         else:
             X = Uex.reshape(-1, self.num_channels).T
             X = scipy.signal.oaconvolve(X[:, None, :], self.temporal_components[None, :, ::-1], mode="full", axes=2)
@@ -144,12 +154,29 @@ class KiloSortMatching(BaseTemplateMatching):
         self.nbefore = self.templates.nbefore
         self.nafter = self.templates.nafter
         self.margin = self.num_samples
-        self.nm = (self.U**2).sum(-1).sum(-1)
+        
+
+        self.is_pushed = False
 
     def get_trace_margin(self):
         return self.margin
 
+
+    def _push_to_torch(self):
+        # this is a trick to delay the creation of tensor on GPU to enable multi processing
+        if self.engine == "torch":
+            self.U = torch.as_tensor(self.U, device=self.torch_device)
+            self.W = torch.as_tensor(self.W, device=self.torch_device)
+            self.trange = torch.as_tensor(self.trange, device=self.torch_device)
+            self.ctc = torch.as_tensor(self.ctc, device=self.torch_device)
+            self.nm = torch.as_tensor(self.nm, device=self.torch_device)
+        self.is_pushed = True
+
+
     def compute_matching(self, traces, start_frame, end_frame, segment_index):
+
+        if not self.is_pushed:
+            self._push_to_torch()
 
         if self.engine == "torch":
             X = torch.as_tensor(traces.T, device=self.torch_device)
