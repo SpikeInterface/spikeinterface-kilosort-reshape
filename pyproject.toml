@@ -6,7 +6,7 @@ authors = [
   { name="Samuel Garcia", email="sam.garcia.die@gmail.com" },
 ]
 
-description = "Adaption of some kilosort algorithm componentss into SpikeInterface"
+description = "Adaption of some kilosort algorithm components into SpikeInterface"
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
