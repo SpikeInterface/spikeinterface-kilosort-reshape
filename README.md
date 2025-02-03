@@ -11,3 +11,13 @@ Note that the template-matching peeler is not a copy/paste from the [Kilosort im
 (https://github.com/MouseLand/Kilosort/blob/main/kilosort/template_matching.py),
 but rather an adaptation to the SpikeInterface framework. Only a portion of the code is from the original file.
 
+
+## Installation
+
+Currently, this package can only be installed from source and it's used for benchmarking purposes:
+
+```bash
+git clone https://github.com/SpikeInterface/spikeinterface-kilosort-components.git
+cd spikeinterface-kilosort-components
+pip install -e .
+```
