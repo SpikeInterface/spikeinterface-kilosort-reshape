@@ -56,21 +56,12 @@ class KiloSortClustering:
     https://www.nature.com/articles/s41592-024-02232-7
     by Marius Patchitariu and collaborators
 
-    This code can only used in the context of spikeinterface.sortingcomponents in the context of the nodepipeline.
-
-    This is a torch implementation of a 
-
-    To build these spatial and temporal components, one should access spikes from the
-    recording, with the following code:
-
-    """
-
-    """
-    hdbscan clustering on peak_locations previously done by localize_peaks()
+    This code can only used in the context of spikeinterface.sortingcomponents in the context of the nodepipeline, and mostly
+    for benchmark purposes. Note that parameters are taken/adapted from KS, results should be similar but not exactly alike
+s    
     """
 
     _default_params = {
-        "radius_um": 50,
         "n_svd": 5,
         "tmp_folder": None,
         "ms_before": 2,
@@ -144,16 +135,16 @@ class KiloSortClustering:
         # features
         node0 = PeakRetriever(recording, peaks)
 
-        radius_um = params["radius_um"]
         node1 = ExtractSparseWaveforms(
             recording,
             parents=[node0],
             return_output=False,
             ms_before=ms_before,
             ms_after=ms_after,
-            radius_um=radius_um,
         )
 
+        ### KS is considering the closest n_nearest_channels for every channels, so we need
+        ### here a small hack for the waveformextractor
         closest_channels = np.argsort(node1.channel_distance, axis=1)
         node1.neighbours_mask[:] = False
         for count, valid in enumerate(closest_channels):
@@ -182,18 +173,24 @@ class KiloSortClustering:
 
         from spikeinterface.sortingcomponents.clustering.tools import FeaturesLoader
 
-        # from spikeinterface.sortingcomponents.peak_localization import localize_peaks
-        # locations = localize_peaks(recording, peaks, method='grid_convolution', 
-        #             ms_before=ms_before, 
-        #             ms_after=ms_after, 
-        #             prototype=prototype, **job_kwargs)
-
         tF = FeaturesLoader.from_dict_or_folder(features_folder)["sparse_tsvd"]
         tF = np.swapaxes(tF, 1, 2)
         tF = torch.as_tensor(tF, device=params["torch_device"])
 
         xcup, ycup = recording.get_channel_locations()[:, 0], recording.get_channel_locations()[:, 1]
         xy = xy_up(xcup, ycup)
+
+        ## This is a key difference between KS 4 and this implementation. Currently, the peaks are
+        ## not realigned wrt to the upsampled grid created by KS. This could be done using the grid convolution
+        ## algorithm here, but this would need some adaptation. This template_index are used to initialize the 
+        ## clustering algorithm.
+
+        # from spikeinterface.sortingcomponents.peak_localization import localize_peaks
+        # locations = localize_peaks(recording, peaks, method='grid_convolution', 
+        #             ms_before=ms_before, 
+        #             ms_after=ms_after, 
+        #             prototype=prototype, **job_kwargs)
+
         iclust_template = peaks['channel_index']
         sparse_mask = node1.neighbours_mask
 
@@ -202,7 +199,6 @@ class KiloSortClustering:
             chan_inds, = np.nonzero(sparse_mask[channel_ind])
             iC[:len(chan_inds), channel_ind] = chan_inds
 
-        print(iC.shape)
         iC = torch.as_tensor(iC, device=params["torch_device"])
         
         #xcup, ycup = ops['xcup'], ops['ycup']
@@ -212,11 +208,13 @@ class KiloSortClustering:
         nskip = params['cluster_downsampling']
         ycent = y_centers(ycup, dmin)
         xcent = x_centers(xcup)
+        print(ycent, xcent)
         nsp = len(peaks)
         Nchan = recording.get_num_channels()
         n_pca = params['n_svd']
         nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
-        
+        print(nearest_center)
+
         clu = np.zeros(nsp, 'int32')
         Wall = torch.zeros((0, Nchan, n_pca))
         Nfilt = None
@@ -526,13 +524,10 @@ def kmeans_plusplus(Xg, niter = 200, seed = 1, device='cuda'):
 def compute_score(mu, mu2, N, ccN, lam):
     mu_pairs  = ((N*mu).unsqueeze(1)  + N*mu)  / (1e-6 + N+N[:,0]).unsqueeze(-1)
     mu2_pairs = ((N*mu2).unsqueeze(1) + N*mu2) / (1e-6 + N+N[:,0]).unsqueeze(-1)
-
     vpair = (mu2_pairs - mu_pairs**2).sum(-1) * (N + N[:,0])
     vsingle = N[:,0] * (mu2 - mu**2).sum(-1)
     dexp = vpair - (vsingle + vsingle.unsqueeze(-1))
-
     dexp = dexp - torch.diag(torch.diag(dexp))
-
     score = (ccN + ccN.T) - lam * dexp
     return score
 
@@ -543,7 +538,6 @@ def run_one(Xd, st0, nskip = 20, lam = 0):
     xtree, tstat = swarmsplitter.split(Xd.numpy(), xtree, tstat, iclust,
                                        my_clus, meta = st0)
     iclust1 = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
-
     return iclust1
 
 def xy_up(xcup, ycup):
@@ -552,7 +546,7 @@ def xy_up(xcup, ycup):
     return xy
 
 
-def x_centers(xc, x_centers=None, seed=5330):
+def x_centers(xc, x_centers=None, seed=5330, sigma=0.5):
     if x_centers is not None:
         # Use this as the input for k-means, either a number of centers
         # or initial guesses.
@@ -576,7 +570,7 @@ def x_centers(xc, x_centers=None, seed=5330):
         bins = np.linspace(min_x - bin_width*2, max_x + bin_width*2, num_bins)
         hist, edges = np.histogram(xc, bins=bins)
         # Apply smoothing to make peak-finding simpler.
-        smoothed = gaussian_filter(hist, sigma=0.5)
+        smoothed = gaussian_filter(hist, sigma=sigma)
         peaks, _ = find_peaks(smoothed)
         # peaks are indices, translate back to position in microns
         approx_centers = [edges[p] for p in peaks]
