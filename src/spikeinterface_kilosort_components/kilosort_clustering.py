@@ -4,9 +4,7 @@ from spikeinterface.sortingcomponents.matching.base import BaseTemplateMatching,
 
 try:
     import torch
-
     HAVE_TORCH = True
-    from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 except ImportError:
     HAVE_TORCH = False
 
@@ -43,9 +41,12 @@ except ImportError:
 
 from tqdm import tqdm 
 
-from kilosort import hierarchical, swarmsplitter
-
 spike_dtype = _base_matching_dtype
+
+
+from scipy.sparse import csr_matrix
+import numpy as np
+
 
 
 class KiloSortClustering:
@@ -251,13 +252,13 @@ s
                         gc.collect()
                         torch.cuda.empty_cache()
 
-                        xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
+                        xtree, tstat, my_clus = maketree(M, iclust, iclust0)
 
-                        xtree, tstat = swarmsplitter.split(
+                        xtree, tstat = split(
                             Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0
                             )
 
-                        iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
+                        iclust = new_clusters(iclust, my_clus, xtree, tstat)
 
                     clu[igood] = iclust + nmax
                     Nfilt = int(iclust.max() + 1)
@@ -535,9 +536,9 @@ def compute_score(mu, mu2, N, ccN, lam):
 def run_one(Xd, st0, nskip = 20, lam = 0):
     iclust, iclust0, M = cluster(Xd, nskip = nskip, lam = 0, seed = 5)
     xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
-    xtree, tstat = swarmsplitter.split(Xd.numpy(), xtree, tstat, iclust,
+    xtree, tstat = split(Xd.numpy(), xtree, tstat, iclust,
                                        my_clus, meta = st0)
-    iclust1 = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
+    iclust1 = new_clusters(iclust, my_clus, xtree, tstat)
     return iclust1
 
 def xy_up(xcup, ycup):
@@ -680,3 +681,261 @@ def assign_iclust0(Xg, mu):
     nm = (mu**2).sum(1)
     iclust = torch.argmax(2*vv-nm, 1)
     return iclust
+
+
+####################### Functions taken for hierarchical clustering ######################
+
+
+
+def cluster_qr(M, iclust, iclust0):
+    NN = M.shape[0]
+    nr = M.shape[1]
+
+    nc = iclust.max()+1
+    q = csr_matrix((np.ones(NN,), (iclust, np.arange(NN))), (nc, NN))
+    r  = csr_matrix((np.ones(nr,), (np.arange(nr), iclust0)), (nr, nc))
+    return q,r
+
+def Mstats_hierarchical(M):
+    m = M.sum()
+    ki = np.array(M.sum(1)).flatten()
+    kj = np.array(M.sum(0)).flatten()
+    ki = m * ki/ki.sum()
+    kj = m * kj/kj.sum()
+    return m, ki, kj
+
+def prepare(M, iclust, iclust0, lam=1):
+    m, ki, kj = Mstats_hierarchical(M)
+    q,r = cluster_qr(M, iclust, iclust0)
+    cc = (q @ M @ r).toarray()
+    nc = cc.shape[0]
+    cneg = .001 + np.outer(q @ ki , kj @ r)/m
+    return cc, cneg
+
+def merge_reduce(cc, cneg, iclust):
+    nmerges = 0
+    nc = cc.shape[0]
+
+    cc = cc + cc.T
+    cneg = cneg + cneg.T
+
+    crat = cc/cneg #(cc + cc.T)/ (cneg + cneg.T)
+    crat = crat -np.diag(np.diag(crat)) - np.eye(crat.shape[0])
+
+    xtree, tstat = find_merges(crat, cc, cneg)
+
+    my_clus = get_my_clus(xtree, tstat)
+    return xtree, tstat, my_clus
+
+def find_merges(crat, cc, cneg):
+    nc = cc.shape[0]
+    xtree = np.zeros((nc-1,3), 'int32')
+    tstat = np.zeros((nc-1,3), 'float32')
+    xnow = np.arange(nc)
+    ntot = np.ones(nc,)
+
+    for nmerges in range(nc-1):
+        y, x = np.unravel_index(np.argmax(crat), cc.shape)
+        lam = crat[y,x]
+
+        m      = cc[y,x] + cc[x,x] + cc[x,y] + cc[y,x]
+        ki = cc[x,x] + cc[x,y]
+        kj = cc[y,y] + cc[y,x]
+        cneg_l = .5 * (ki * kj + (m-ki) * (m-kj)) / m
+        cpos_l = cc[y,x] + cc[x,y]
+        M      = cpos_l / cneg_l
+
+        cc[y]   = cc[y] + cc[x]
+        cc[:,y] = cc[:,y] + cc[:,x]
+        cc[x]   = -1
+        cc[:,x] = -1
+        cneg[y]   = cneg[y]   + cneg[x]
+        cneg[:,y] = cneg[:,y] + cneg[:,x]
+
+        crat[y] = cc[y]/cneg[y]
+        crat[:,y] = crat[y]
+        crat[y,y] = -1
+        crat[x] = -1
+        crat[:,x]=-1
+
+        xtree[nmerges,:] = [xnow[x], xnow[y], nmerges + nc]
+        tstat[nmerges,:] = [lam, ntot[x]+ntot[y], M]
+
+        ntot[y] +=ntot[x]
+        xnow[y] = nc+nmerges
+
+    return xtree, tstat
+
+def get_my_clus(xtree, tstat):
+    nc = xtree.shape[0]+1
+    my_clus = [[j] for j in range(nc)]
+    for t in range(nc-1):
+        new_clus = my_clus[xtree[t,1]].copy()
+        new_clus.extend(my_clus[xtree[t,0]])
+        my_clus.append(new_clus)
+    return my_clus
+
+def maketree(M, iclust, iclust0):
+
+    #m, ki, kj = Mstats(M)
+    #iclust = swarmer.assign_iclust(M, ki, kj, m, iclust[::nskip], lam = 1)
+    #iclust, nc  = swarmer.cleanup_index(iclust)
+
+    nc = np.max(iclust) + 1
+
+    cc, cneg        = prepare(M, iclust, iclust0, lam = 1)
+    xtree, tstat, my_clus  = merge_reduce(cc, cneg, iclust)
+
+    return xtree, tstat, my_clus
+
+
+####################### Functions taken from swarmsplitter ######################
+
+import numpy as np
+from numba import njit
+import math
+
+def count_elements(kk, iclust, my_clus, xtree):
+    n1 = np.isin(iclust, my_clus[xtree[kk, 0]]).sum()
+    n2 = np.isin(iclust, my_clus[xtree[kk, 1]]).sum()
+    return n1, n2
+
+def check_split(Xd, kk, xtree, iclust, my_clus):
+    ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
+    iclu = iclust[ixy]
+    labels = 2*np.isin(iclu, my_clus[xtree[kk, 0]]) - 1
+
+    Xs = Xd[ixy]
+    Xs[:,-1] = 1
+
+    w = np.ones((Xs.shape[0],1))
+    w[labels>0] = np.mean(labels<0)
+    w[labels<0] = np.mean(labels>0)
+
+    CC = Xs.T @ (Xs * w)
+    CC = CC + .01 * np.eye(CC.shape[0])
+    b = np.linalg.solve(CC, labels @ (Xs * w))
+    xproj = Xs @ b
+
+    score = bimod_score(xproj)
+    return xproj, score
+
+def clean_tree(valid_merge, xtree, inode):
+    ix = (xtree[:,2]==inode).nonzero()[0]
+    if len(ix)==0:
+        return
+    valid_merge[ix] = 0
+    clean_tree(valid_merge, xtree, xtree[ix, 0])
+    clean_tree(valid_merge, xtree, xtree[ix, 1])
+    return
+
+def bimod_score(xproj):
+    from scipy.ndimage import gaussian_filter1d
+    xbin, _ = np.histogram(xproj, np.linspace(-2,2,400))
+    xbin = gaussian_filter1d(xbin.astype('float32'), 4)
+
+    imin = np.argmin(xbin[175:225])
+    xmin = np.min(xbin[175:225])
+    xm1  = np.max(xbin[:imin+175])
+    xm2  = np.max(xbin[imin+175:])
+
+    score = 1 - np.maximum(xmin/xm1, xmin/xm2)
+    return score
+
+
+def refractoriness(st1, st2):
+    # compute goodness of st1, st2, and both
+
+    is_refractory = True #check_CCG(st1, st2)[1]
+    if is_refractory:
+        criterion = 1 # never split
+        #print('this is refractory')
+    else:
+        criterion = 0
+        #good_0 = check_CCG(np.hstack((st1,st2)))[0]
+        #good_1 = check_CCG(st1)[0]
+        #good_2 = check_CCG(st2)[0]
+        #print(good_0, good_1, good_2)
+        #if (good_0==1) and (good_1==0) and (good_2==0):
+        #    criterion = 1 # don't split
+        #    print('good cluster becomes bad')
+    return criterion
+
+def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
+    xtree = np.array(xtree)
+
+    kk = xtree.shape[0]-1
+    nc = xtree.shape[0] + 1
+    valid_merge = np.ones((nc-1,), 'bool')
+
+
+    for kk in range(nc-2,-1,-1):
+        if not valid_merge[kk]:
+            continue;
+
+        ix1 = np.isin(iclust, my_clus[xtree[kk, 0]])
+        ix2 = np.isin(iclust, my_clus[xtree[kk, 1]])
+
+        criterion = 0
+        score = np.NaN
+        if criterion==0:
+            # first mutation is global modularity
+            if tstat[kk,0] < 0.2:
+                criterion = -1
+
+
+        if meta is not None and criterion==0:
+            # second mutation is based on meta_data
+            criterion = refractoriness(meta[ix1],meta[ix2])
+            #criterion = 0
+        
+        if criterion==0:
+            xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
+            # third mutation is bimodality
+            #xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
+            criterion = 2 * (score <  .6) - 1
+
+        if criterion==0:
+            # fourth mutation is local modularity (not reachable)
+            score = tstat[kk,-1]
+            criterion = score > .15
+
+        if verbose:
+            n1,n2 = ix1.sum(), ix2.sum()
+            #print('%3.0d, %6.0d, %6.0d, %6.0d, %2.2f,%4.2f, %2.2f'%(kk, n1, n2,n1+n2,
+            #tstat[kk,0], tstat[kk,-1], score))
+
+        if criterion==1:
+            valid_merge[kk] = 0
+            clean_tree(valid_merge, xtree, xtree[kk,0])
+            clean_tree(valid_merge, xtree, xtree[kk,1])
+
+    tstat = tstat[valid_merge]
+    xtree = xtree[valid_merge]
+
+    return xtree, tstat
+
+
+def new_clusters(iclust, my_clus, xtree, tstat):
+
+    if len(xtree)==0:
+        return np.zeros_like(iclust)
+         
+
+    nc = xtree.max() + 1
+
+    isleaf = np.zeros(2*nc-1,)
+    isleaf[xtree[:,0]] = 1
+    isleaf[xtree[:,1]] = 1
+    isleaf[xtree[:,2]] = 0
+
+    ind = np.nonzero(isleaf)[0]
+    iclust1 = iclust.copy()
+    for j in range(len(ind)):
+        ix = np.isin(iclust, my_clus[ind[j]])
+        iclust1[ix] = j
+        xtree[xtree[:,0] == ind[j], 0] = j
+        xtree[xtree[:,1] == ind[j], 1] = j
+
+
+    return iclust1
