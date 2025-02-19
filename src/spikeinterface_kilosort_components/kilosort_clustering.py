@@ -70,7 +70,7 @@ class KiloSortClustering:
     """
 
     _default_params = {
-        "radius_um": 100,
+        "radius_um": 50,
         "n_svd": 5,
         "tmp_folder": None,
         "ms_before": 2,
@@ -80,7 +80,7 @@ class KiloSortClustering:
         "engine": "torch",
         "torch_device": "cpu",
         "cluster_downsampling": 20,
-        "nskip" : 30
+        "n_nearest_channels" : 10
     }
 
 
@@ -112,12 +112,14 @@ class KiloSortClustering:
         )
         wfs = few_wfs[:, :, 0]
         
-        # Ensure all waveforms have a positive max
-        wfs *= np.sign(wfs[:, nbefore])[:, np.newaxis]
-
         # Remove outliers
         valid = np.argmax(np.abs(wfs), axis=1) == nbefore
         wfs = wfs[valid]
+
+        prototype = np.nanmedian(wfs, 0) 
+
+        # Ensure all waveforms have a positive max
+        wfs *= np.sign(wfs[:, nbefore])[:, np.newaxis]
 
         from sklearn.decomposition import TruncatedSVD
 
@@ -152,6 +154,12 @@ class KiloSortClustering:
             radius_um=radius_um,
         )
 
+        closest_channels = np.argsort(node1.channel_distance, axis=1)
+        node1.neighbours_mask[:] = False
+        for count, valid in enumerate(closest_channels):
+            node1.neighbours_mask[count, valid[:params["n_nearest_channels"]]] = True
+        node1.max_num_chans = np.max(np.sum(node1.neighbours_mask, axis=1))
+
         node2 = TemporalPCAProjection(
             recording, parents=[node0, node1], return_output=True, model_folder_path=model_folder
         )
@@ -174,17 +182,30 @@ class KiloSortClustering:
 
         from spikeinterface.sortingcomponents.clustering.tools import FeaturesLoader
 
+        # from spikeinterface.sortingcomponents.peak_localization import localize_peaks
+        # locations = localize_peaks(recording, peaks, method='grid_convolution', 
+        #             ms_before=ms_before, 
+        #             ms_after=ms_after, 
+        #             prototype=prototype, **job_kwargs)
+
         tF = FeaturesLoader.from_dict_or_folder(features_folder)["sparse_tsvd"]
+        tF = np.swapaxes(tF, 1, 2)
+        tF = torch.as_tensor(tF, device=params["torch_device"])
 
         xcup, ycup = recording.get_channel_locations()[:, 0], recording.get_channel_locations()[:, 1]
         xy = xy_up(xcup, ycup)
         iclust_template = peaks['channel_index']
         sparse_mask = node1.neighbours_mask
-        iC = torch.as_tensor(get_channel_distances(recording) <= radius_um, device=params["torch_device"])
+
+        iC = np.zeros((sparse_mask.sum(1).max(), len(sparse_mask)), dtype='int32')
+        for channel_ind in range(len(iC)):
+            chan_inds, = np.nonzero(sparse_mask[channel_ind])
+            iC[:len(chan_inds), channel_ind] = chan_inds
+
+        print(iC.shape)
+        iC = torch.as_tensor(iC, device=params["torch_device"])
         
         #xcup, ycup = ops['xcup'], ops['ycup']
-
-        print(tF.shape, iC.shape)
 
         dmin  = np.median(np.diff(np.unique(ycup)))
         dminx = 32
@@ -204,7 +225,7 @@ class KiloSortClustering:
         prog = np.arange(len(ycent))
         
         try:
-            for kk in prog:
+            for kk in tqdm(prog):
                 for jj in np.arange(len(xcent)):
                     # Get data for all templates that were closest to this x,y center.
                     ii = kk + jj*ycent.size
@@ -224,7 +245,6 @@ class KiloSortClustering:
                         iclust = torch.zeros((Xd.shape[0],))
                     else:
                         st0 = None
-
                         # find new clusters
                         iclust, iclust0, M, _ = cluster(
                             Xd, nskip=nskip, lam=1, seed=5, device=params["torch_device"]
@@ -268,7 +288,7 @@ class KiloSortClustering:
                 'Wall is empty after `clustering_qr.run`, cannot continue clustering.'
             )
 
-        return clu, Wall
+        return np.unique(clu), clu
         
 
 
@@ -386,7 +406,6 @@ def cluster(Xd, iclust = None, kn = None, nskip = 20, n_neigh = 10, nclust = 200
 
     m, ki, kj = Mstats(M, device=device)
 
-    #Xg = torch.from_numpy(Xd).to(dev)
     Xg = Xd.to(device)
     kn = torch.from_numpy(kn).to(device)
 
@@ -537,7 +556,7 @@ def x_centers(xc, x_centers=None, seed=5330):
     if x_centers is not None:
         # Use this as the input for k-means, either a number of centers
         # or initial guesses.
-        approx_centers = k
+        approx_centers = x_centers
     else:
         # NOTE: This automated method does not work well for 2D array probes.
         #       We recommend specifying `x_centers` manually for that case.
@@ -629,16 +648,16 @@ def get_data_cpu(xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
 
     pid = PID[igood]
     data = tF[igood]
-    nspikes, nchanraw, nfeatures = data.shape
+    nspikes, _, nfeatures = data.shape
+
     ichan = torch.unique(iC[:, ix])
     ch_min = torch.min(ichan)
     ch_max = torch.max(ichan)+1
     nchan = ch_max - ch_min
-
     dd = torch.zeros((nspikes, nchan, nfeatures))
-    for j in ix.nonzero()[:,0]:
+
+    for j in ix.nonzero()[:, 0]:
         ij = torch.nonzero(pid==j)[:, 0]
-        #print(ij.sum())
         dd[ij.unsqueeze(-1), iC[:,j]-ch_min] = data[ij]
 
     if merge_dim:
