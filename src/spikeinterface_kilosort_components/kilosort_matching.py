@@ -79,7 +79,7 @@ class KiloSortMatching(BaseTemplateMatching):
         self.temporal_components = temporal_components
         self.Th = Th
         self.max_iter = max_iter
-        self.engine = "torch"
+        self.engine = engine
         self.torch_device = torch_device
 
         self.num_components = len(self.temporal_components)
