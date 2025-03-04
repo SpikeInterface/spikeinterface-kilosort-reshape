@@ -201,20 +201,17 @@ s
             iC[:len(chan_inds), channel_ind] = chan_inds
 
         iC = torch.as_tensor(iC, device=params["torch_device"])
-        
-        #xcup, ycup = ops['xcup'], ops['ycup']
 
         dmin  = np.median(np.diff(np.unique(ycup)))
         dminx = 32
         nskip = params['cluster_downsampling']
         ycent = y_centers(ycup, dmin)
+        print(ycent)
         xcent = x_centers(xcup)
-        print(ycent, xcent)
         nsp = len(peaks)
         Nchan = recording.get_num_channels()
         n_pca = params['n_svd']
         nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
-        print(nearest_center)
 
         clu = np.zeros(nsp, 'int32')
         Wall = torch.zeros((0, Nchan, n_pca))
@@ -326,25 +323,6 @@ def neigh_mat(Xd, nskip=10, n_neigh=30):
 
     return kn, M
 
-
-def assign_mu(iclust, Xg, cols_mu, tones, nclust = None, lpow = 1):
-    NN, nfeat = Xg.shape
-
-    rows = iclust.unsqueeze(-1).tile((1,nfeat))
-    ii = torch.vstack((rows.flatten(), cols_mu.flatten()))
-    iin = torch.vstack((rows[:,0], cols_mu[:,0]))
-    if lpow==1:
-        C = coo(ii, Xg.flatten(), (nclust, nfeat))
-    else:
-        C = coo(ii, (Xg**lpow).flatten(), (nclust, nfeat))
-    N = coo(iin, tones, (nclust, 1))
-    C = C.to_dense()
-    N = N.to_dense()
-    mu = C / (1e-6 + N)
-
-    return mu, N
-
-
 def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device='cuda'):
     NN = kn.shape[0]
 
@@ -363,7 +341,6 @@ def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device='
     iclust = torch.argmax(xN, 1)
 
     return iclust
-
 
 def assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,ki,kj, device='cuda'):
     n_neigh = kn.shape[1]
@@ -398,37 +375,35 @@ def Mstats(M, device='cuda'):
 
 
 def cluster(Xd, iclust = None, kn = None, nskip = 20, n_neigh = 10, nclust = 200, 
-            seed = 1, niter = 200, lam = 0, device='cuda'):    
+            seed = 1, niter = 200, lam = 0, device='cuda'):  
 
     if kn is None:
-        kn, M = neigh_mat(Xd, nskip = nskip, n_neigh = n_neigh)
-
+        kn, M = neigh_mat(Xd, nskip=nskip, n_neigh=n_neigh)
     m, ki, kj = Mstats(M, device=device)
 
     Xg = Xd.to(device)
     kn = torch.from_numpy(kn).to(device)
-
     n_neigh = kn.shape[1]
     NN, nfeat = Xg.shape
     nsub = (NN-1)//nskip + 1
-
-    rows_neigh = torch.arange(NN, device = device).unsqueeze(-1).tile((1,n_neigh))
-    
-    tones2 = torch.ones((NN, n_neigh), device = device)
+    rows_neigh = torch.arange(NN, device=device).unsqueeze(-1).tile((1,n_neigh))
+    tones2 = torch.ones((NN, n_neigh), device=device)
 
     if iclust is None:
-        iclust_init =  kmeans_plusplus(Xg, niter = nclust, seed = seed, device=device)
+        iclust_init =  kmeans_plusplus(Xg, niter=nclust, seed=seed, 
+                                       device=device)
         iclust = iclust_init.clone()
     else:
         iclust_init = iclust.clone()
         
     for t in range(niter):
         # given iclust, reassign isub
-        isub = assign_isub(iclust, kn, tones2, nclust , nsub, lam, m,ki,kj, device=device)
-
+        isub = assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,
+                           ki, kj,device=device)
         # given mu and isub, reassign iclust
-        iclust = assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=device)
-    
+        iclust = assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m,
+                               ki, kj, device=device)
+
     _, iclust = torch.unique(iclust, return_inverse=True)    
     nclust = iclust.max() + 1
     isub = assign_isub(iclust, kn, tones2, nclust , nsub, lam, m,ki,kj, device=device)
@@ -439,26 +414,54 @@ def cluster(Xd, iclust = None, kn = None, nskip = 20, n_neigh = 10, nclust = 200
     return iclust, isub, M, iclust_init
 
 
-def kmeans_plusplus(Xg, niter = 200, seed = 1, device='cuda'):
-    # Xg is number of spikes by number of features
-    # we are finding cluster centroids and assigning each spike to a centroid
+def subsample_idx(n1, n2):
+    """Get boolean mask and reverse mapping for evenly distributed subsample.
     
-    #Xg = torch.from_numpy(Xd).to(dev)    
-    vtot = (Xg**2).sum(1)
+    Parameters
+    ----------
+    n1 : int
+        Size of index. Index is assumed to be sequential and not contain any
+        missing values (i.e. 0, 1, 2, ... n1-1).
+    n2 : int
+        Number of indices to remove to create a subsample. Removed indices are
+        evenly spaced across 
+    
+    Returns
+    -------
+    idx : np.ndarray
+        Boolean mask, True for indices to be included in the subset.
+    rev_idx : np.ndarray
+        Map between subset indices and their position in the original index.
+
+    Examples
+    --------
+    >>> subsample_idx(6, 3)
+    array([False,  True, False,  True,  True, False], dtype=bool),
+    array([1, 3, 4], dtype=int64)
+
+    """
+    remove = np.round(np.linspace(0, n1-1, n2)).astype(int)
+    idx = np.ones(n1, dtype=bool)
+    idx[remove] = False
+    # Also need to map the indices from the subset back to indices for
+    # the full tensor.
+    rev_idx = idx.nonzero()[0]
+
+    return idx, rev_idx
+
+def kmeans_plusplus(Xg, niter = 200, seed = 1, device='cuda'):
+    # Xg is number of spikes by number of features.
+    # We are finding cluster centroids and assigning each spike to a centroid.
+    vtot = torch.norm(Xg, 2, dim=1)**2
 
     n1 = vtot.shape[0]
     if n1 > 2**24:
-        # this subsampling step is just for the candidate spikes to be considered as new centroids
-        # Need to subsample v2, torch.multinomial doesn't allow more than 2**24
-        # elements. We're just using this to sample some spikes, so it's fine to
-        # not use all of them.
+        # This subsampling step is just for the candidate spikes to be considered
+        # as new centroids. Sometimes need to subsample v2 since
+        # torch.multinomial doesn't allow more than 2**24 elements. We're just
+        # using this to sample some spikes, so it's fine to not use all of them.
         n2 = n1 - 2**24   # number of spikes to remove before sampling
-        remove = np.round(np.linspace(0, n1-1, n2)).astype(int)
-        idx = np.ones(n1, dtype=bool)
-        idx[remove] = False
-        # Also need to map the indices from the subset back to indices for
-        # the full tensor.
-        rev_idx = idx.nonzero()[0]
+        idx, rev_idx = subsample_idx(n1, n2)
         subsample = True
     else:
         subsample = False
@@ -466,16 +469,20 @@ def kmeans_plusplus(Xg, niter = 200, seed = 1, device='cuda'):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    ntry = 100 # ntry is the number of potential cluster targets to test on each iteration
-    NN, nfeat = Xg.shape    
-    mu = torch.zeros((niter, nfeat), device = device) # this will store cluster means
-    vexp0 = torch.zeros(NN,device = device) # this will store the best variance explained so far for each spike 
-
+    ntry = 100  # number of candidate cluster centroids to test on each iteration
+    NN, nfeat = Xg.shape
+    # Need to store the spike features used for each cluster centroid (mu),
+    # best variance explained so far for each spike (vexp0),
+    # and the cluster assignment for each spike (iclust).
+    mu = torch.zeros((niter, nfeat), device = device)
+    vexp0 = torch.zeros(NN, device = device)
     iclust = torch.zeros((NN,), dtype = torch.int, device = device)
-    # on every iteration we add one new centroid to the "set" of centroids
-    # we keep track of how well n centroids so far explain each spike
-    # we ask, if we were to add another centroid, which spikes would that increase the explained variance for 
-    # and by how much. We use ntry candidates on each iteration. 
+
+    # On every iteration we choose one new centroid to keep.
+    # We track how well n centroids so far explain each spike.
+    # We ask, if we were to add another centroid, which spikes would that
+    # increase the explained variance for and by how much?
+    # We use ntry candidates on each iteration.
     for j in range(niter):
         # v2 is the un-explained variance so far for each spike
         v2 = torch.relu(vtot - vexp0)
@@ -488,33 +495,42 @@ def kmeans_plusplus(Xg, niter = 200, seed = 1, device='cuda'):
         else:
             isamp = torch.multinomial(v2, ntry)
 
-        # Xc are the new centroids to be tested. The spikes themselves are used as centroids. 
-        Xc = Xg[isamp]    
+        try:
+            # The new centroids to be tested, sampled from the spikes in Xg.
+            Xc = Xg[isamp]
+            # Variance explained for each spike for the new centroids.
+            vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
+            # Difference between variance explained for new centroids
+            # and best explained variance so far across all iterations.
+            # This gets relu-ed, since only the positive increases will actually
+            # re-assign a spike to this new cluster
+            dexp = torch.relu(vexp - vexp0.unsqueeze(1))
+            # Sum all positive increases to determine additional explained variance
+            # for each candidate centroid.
+            vsum = dexp.sum(0)
+            # Pick the candidate which increases explained variance the most 
+            imax = torch.argmax(vsum)
 
-        # this is how much variance the new centroids would explain for each spike
-        vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
+            # For that centroid (Xc[imax]), determine which spikes actually get
+            # more variance from it
+            ix = dexp[:, imax] > 0
 
-        # this is the comparison between how much variance the new centroids explain, and the best explained variance so far
-        dexp = vexp - vexp0.unsqueeze(1)
+            iclust[ix] = j    # assign new cluster identity
+            mu[j] = Xc[imax]  # spike features used as centroid for cluster j
+            # Update variance explained for the spikes assigned to cluster j
+            vexp0[ix] = vexp[ix, imax]
 
-        # this gets relu-ed, since only the positive increases will actually re-assign a spike to this new cluster 
-        dexp = torch.relu(dexp)
+            # Delete large variables between iterations
+            # to prevent excessive memory reservation.
+            del(vexp)
+            del(dexp)
 
-        # we sum all the positive increases to determine how much explained variance each candidate adds 
-        vsum = dexp.sum(0)
+        except torch.cuda.OutOfMemoryError:
+            raise
 
-        # we pick the candidate which increases explained variance the most 
-        imax = torch.argmax(vsum)
-
-        # for that particular candidate (Xc[imax]) we determine which spikes actually get more variance from it
-        ix = dexp[:, imax] > 0 
-
-        mu[j] = Xg[ix].mean(0) # this mean is not actually used. We should use it to keep track of Xc
-        # mu[j] = Xc[imax] # this to keep track of the actual centroids used to assign spikes
-        vexp0[ix] = vexp[ix,imax] # update the variance explained for these particular spikes
-        iclust[ix] = j # assign new cluster identity
-
-    # if the clustering above is done on a subset of Xg, then we need to assign all Xgs here to get an iclust 
+    # NOTE: For very large datasets, we may end up needing to subsample Xg.
+    # If the clustering above is done on a subset of Xg,
+    # then we need to assign all Xgs here to get an iclust 
     # for ii in range((len(Xg)-1)//nblock +1):
     #     vexp = 2 * Xg[ii*nblock:(ii+1)*nblock] @ mu.T - (mu**2).sum(1)
     #     iclust[ii*nblock:(ii+1)*nblock] = torch.argmax(vexp, dim=-1)
@@ -522,32 +538,13 @@ def kmeans_plusplus(Xg, niter = 200, seed = 1, device='cuda'):
     return iclust
 
 
-def compute_score(mu, mu2, N, ccN, lam):
-    mu_pairs  = ((N*mu).unsqueeze(1)  + N*mu)  / (1e-6 + N+N[:,0]).unsqueeze(-1)
-    mu2_pairs = ((N*mu2).unsqueeze(1) + N*mu2) / (1e-6 + N+N[:,0]).unsqueeze(-1)
-    vpair = (mu2_pairs - mu_pairs**2).sum(-1) * (N + N[:,0])
-    vsingle = N[:,0] * (mu2 - mu**2).sum(-1)
-    dexp = vpair - (vsingle + vsingle.unsqueeze(-1))
-    dexp = dexp - torch.diag(torch.diag(dexp))
-    score = (ccN + ccN.T) - lam * dexp
-    return score
-
-
-def run_one(Xd, st0, nskip = 20, lam = 0):
-    iclust, iclust0, M = cluster(Xd, nskip = nskip, lam = 0, seed = 5)
-    xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
-    xtree, tstat = split(Xd.numpy(), xtree, tstat, iclust,
-                                       my_clus, meta = st0)
-    iclust1 = new_clusters(iclust, my_clus, xtree, tstat)
-    return iclust1
-
 def xy_up(xcup, ycup):
     xy = np.vstack((xcup, ycup))
     xy = torch.from_numpy(xy)
     return xy
 
 
-def x_centers(xc, x_centers=None, seed=5330, sigma=0.5):
+def x_centers(xc, x_centers=None, seed=5330, sigma=0.5, bin_width=50):
     if x_centers is not None:
         # Use this as the input for k-means, either a number of centers
         # or initial guesses.
@@ -560,7 +557,6 @@ def x_centers(xc, x_centers=None, seed=5330, sigma=0.5):
         # to not couple this behavior with that setting. A bin size of 50 microns
         # seems to work well for NP1 and 2, tetrodes, and 2D arrays. We can make
         # this a parameter later on if it becomes a problem.
-        bin_width = 50
         min_x = xc.min()
         max_x = xc.max()
 
@@ -713,13 +709,11 @@ def prepare(M, iclust, iclust0, lam=1):
     return cc, cneg
 
 def merge_reduce(cc, cneg, iclust):
-    nmerges = 0
-    nc = cc.shape[0]
 
     cc = cc + cc.T
     cneg = cneg + cneg.T
 
-    crat = cc/cneg #(cc + cc.T)/ (cneg + cneg.T)
+    crat = cc/cneg
     crat = crat -np.diag(np.diag(crat)) - np.eye(crat.shape[0])
 
     xtree, tstat = find_merges(crat, cc, cneg)
@@ -776,16 +770,8 @@ def get_my_clus(xtree, tstat):
     return my_clus
 
 def maketree(M, iclust, iclust0):
-
-    #m, ki, kj = Mstats(M)
-    #iclust = swarmer.assign_iclust(M, ki, kj, m, iclust[::nskip], lam = 1)
-    #iclust, nc  = swarmer.cleanup_index(iclust)
-
-    nc = np.max(iclust) + 1
-
     cc, cneg        = prepare(M, iclust, iclust0, lam = 1)
     xtree, tstat, my_clus  = merge_reduce(cc, cneg, iclust)
-
     return xtree, tstat, my_clus
 
 
@@ -849,16 +835,8 @@ def refractoriness(st1, st2):
     is_refractory = True #check_CCG(st1, st2)[1]
     if is_refractory:
         criterion = 1 # never split
-        #print('this is refractory')
     else:
         criterion = 0
-        #good_0 = check_CCG(np.hstack((st1,st2)))[0]
-        #good_1 = check_CCG(st1)[0]
-        #good_2 = check_CCG(st2)[0]
-        #print(good_0, good_1, good_2)
-        #if (good_0==1) and (good_1==0) and (good_2==0):
-        #    criterion = 1 # don't split
-        #    print('good cluster becomes bad')
     return criterion
 
 def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
@@ -871,7 +849,7 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
 
     for kk in range(nc-2,-1,-1):
         if not valid_merge[kk]:
-            continue;
+            continue
 
         ix1 = np.isin(iclust, my_clus[xtree[kk, 0]])
         ix2 = np.isin(iclust, my_clus[xtree[kk, 1]])
